@@ -1,3 +1,83 @@
+## On Baselines in LLM Architecture Research, a Tale of DeltaNet and RWKV-7
+
+A few days ago I saw this curious chart from Songlin of DeltaNet:
+
+![image](https://github.com/user-attachments/assets/f94f57bd-ee7f-408b-a608-60a38218da66)
+
+which is strange, because we have this in RWKV-7 paper:
+
+![image](https://github.com/user-attachments/assets/b439eb14-5672-4c4b-b6d9-c5bbad21d8d3)
+
+Our code is at https://github.com/Triang-jyed-driung/zoology-rwkv and the average MQAR accuracy for RWKV-7 is **0.94+ for state dim 8k, and 0.99+ for size dim 16k**.
+
+So I checked HazyResearch/zoology repo and found a few issues.
+
+Firstly, the state size of RWKV-7 was incorrectly computed, exaggerated to 4x for d_model=128, and 16x for d_model=256.
+
+The correct state size formula **(num_heads * head_k_dim * head_v_dim)** is the same for RWKV-7 and DeltaNet, but a wrong formula (num_heads * k_dim * v_dim) was used for RWKV-7.
+
+Fortunately the kind zoology folks fixed it soon:
+
+![image](https://github.com/user-attachments/assets/92659604-2826-448c-9219-7008e769fd72)
+
+Now the yellow RWKV-7 points look a bit better (if you were using zoology to compare RWKV-7, please remember to correct your results, thank you!):
+
+![image](https://github.com/user-attachments/assets/a99088a3-b2bc-48bc-9e8c-87e986fa49c2)
+
+For example, this is from the recent ATLAS (2505.23735) paper, and the green RWKV-7 points were incorrectly positioned (the exact setup of the paper is not known, so this is an illustration):
+
+![image](https://github.com/user-attachments/assets/ceb62cc6-53eb-4d30-9542-ec68b111c515)
+
+The second major issue is, a short-conv of length 4 is highly beneficial for grokking this toy MQAR task (but NOT for real language modeling), and it's given to all other arch, except RWKV-7, which is using its default token-shift (similar to a short-conv of length 2), putting it at an unfair disadvantage.
+
+From zoology readme:
+
+![image](https://github.com/user-attachments/assets/e8a38c4d-b0c5-493d-af0b-f4870c12e58f)
+
+And there are known issues with current RWKV-7 implementation (including kernel precision) in FLA repo (everyone is working on fixing these, but it takes time, so please use RWKV-LM kernel before that) used by zoology repo.
+
+So I do the simplest thing: I simply **replace the DeltaNet kernel in zoology delta_net.py by RWKV-7 kernel (from RWKV-LM repo)**, because the DeltaNet implementation in zoology is considered great, and this will be the most direct apples-to-apples comparison.
+
+Let's review the formulas, for a single head.
+
+This is DeltaNet kernel where βt are scalars:
+
+![image](https://github.com/user-attachments/assets/c1ceb954-e113-4d0c-bda8-9691199d4808)
+
+This is GatedDeltaNet kernel where αt and βt are scalars:
+
+![image](https://github.com/user-attachments/assets/0b85145e-aeef-4c2f-af93-033fa1be0dc0)
+
+This is RWKV-7 kernel where w/a/b/v/k are general vectors:
+
+![image](https://github.com/user-attachments/assets/510d848c-2670-41d9-b0e3-15a484635200)
+
+The RWKV-7 kernel is **strictly more expressive** (note it's not following vanilla delta rule - we called it **generalized delta rule** in RWKV-7 paper), which is reflected in performances of various tasks.
+
+As a starting point, we can allow β to be vectors, and use RWKV-7 kernel with w = 1, a = -βk, b = k, v = βv, k = k, to get BetterDeltaNet.
+
+Let's compare [BetterDeltaNet using RWKV-7 kernel (black)] vs [DeltaNet (color)] on the most difficult MQAR task (8192 state sz, 256 kv pairs):
+
+| loss | accuracy |
+| ---- | ---- |
+| ![image](https://github.com/user-attachments/assets/34a6f573-89f0-472b-afae-bc0941ef1774) | LR 1e-3, BDN-acc-256 = 12.92 ± 0.00%, DN-acc-256 = 8.88 ± 0.19% |
+| ![image](https://github.com/user-attachments/assets/5fd604a4-5f04-4f35-bf70-cb92136c6ae0) | LR 3e-3, BDN-acc-256 = 14.31 ± 0.07 %, DN-acc-256 = 11.46 ± 0.14 % |
+| ![image](https://github.com/user-attachments/assets/6870dbfe-c431-48eb-a77b-b0f7b23ccff0) | LR 1e-2, BDN-acc-256 = 12.84 ± 0.36 %, DN-acc-256 = 11.62 ± 0.10 % |
+| ![image](https://github.com/user-attachments/assets/49512963-f2bd-431b-a502-7b0ade7572ea) | LR 3e-2, BDN-acc-256 = 13.67 ± 0.48 %, DN-acc-256 = 12.78 ± 1.35 % |
+| ![image](https://github.com/user-attachments/assets/dda3f0e0-ecd8-4aff-af51-169b75d90d63) | LR 4.6e-2 (this is the highest stable LR for DN in this setup), DN-acc-256 = 13.09 ± 0.67 % |
+
+14.31 ± 0.07% vs 13.09 ± 0.67%. BetterDeltaNet with RWKV-7 kernel wins.
+
+There are plenty of further improvements in RWKV-7, and here I show a simple replacement of DeltaNet by RWKV-7 kernel (without adding further improvements from RWKV-7) is enough to boost performance, as it should be, because as I said, the RWKV-7 kernel is **strictly more expressive**.
+
+### Conclusion:
+
+It can be hard to produce correct baselines. I notice the transformer baseline is usually badly trained in most "new LLM arch" paper too.
+
+Please use https://github.com/BlinkDL/RWKV-LM/tree/main/RWKV-v7/train_temp as starting point if you'd like to compare RWKV-7. Thank you.
+
+# Original README
+
 <div align="center" >
     <img src="assets/banner.png" height=150 alt="Meerkat logo" style="margin-bottom:px"/> 
 
