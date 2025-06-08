@@ -11,7 +11,7 @@ from einops import rearrange
 from torch.nn import functional as F
 
 from fla.modules import FusedRMSNormSwishGate, RMSNorm, ShortConvolution
-from fla.ops.delta_rule import chunk_delta_rule, fused_recurrent_delta_rule
+# from fla.ops.delta_rule import chunk_delta_rule, fused_recurrent_delta_rule
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -26,6 +26,43 @@ def elu_p1(x):
 def sum_norm(x):
     return (x / x.sum(-1, keepdim=True)).to(x)
 
+# RWKV-7 kernel from https://github.com/BlinkDL/RWKV-LM
+CHUNK_LEN = 16
+from torch.utils.cpp_extension import load
+import os
+here = os.path.dirname(os.path.realpath(__file__))
+flags = ['-res-usage', f'-D_C_=32', f"-D_CHUNK_LEN_={CHUNK_LEN}", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"]
+load(name="rwkv7_wind_fp32_hs32", sources=[f'{here}/rwkv7_fp32_hs32.cu', f'{here}/rwkv7_fp32_hs32.cpp'], is_python_module=False, verbose=True, extra_cuda_cflags=flags)
+class rwkv7_wind_fp32(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, w,r,k,v,z,b):
+        B,T,H,C = w.shape 
+        assert T%CHUNK_LEN == 0
+        assert all(i.dtype==torch.float32 for i in [w,r,k,v,z,b])
+        assert all(i.is_contiguous() for i in [w,r,k,v,z,b])
+        y = torch.empty_like(v)
+        s = torch.empty(B,H,T//CHUNK_LEN,C,C, dtype=torch.float32,device=w.device)
+        sa = torch.empty(B,T,H,C, dtype=torch.float32,device=w.device)
+        assert C==32 # please change f'-D_C_=32' in flags to test other C
+        if C==32: torch.ops.rwkv7_wind_fp32 = torch.ops.rwkv7_wind_fp32_hs32
+        torch.ops.rwkv7_wind_fp32.forward(w,r,k,v,z,b, y,s,sa)
+        ctx.save_for_backward(w,r,k,v,z,b,s,sa)
+        return y
+    @staticmethod
+    def backward(ctx, dy):
+        assert all(i.dtype==torch.float32 for i in [dy])
+        assert all(i.is_contiguous() for i in [dy])
+        w,r,k,v,z,b,s,sa = ctx.saved_tensors
+        B,T,H,C = w.shape 
+        dw,dr,dk,dv,dz,db = [torch.empty_like(x) for x in [w,r,k,v,z,b]]
+        assert C==32 # please change f'-D_C_=32' in flags to test other C
+        if C==32: torch.ops.rwkv7_wind_fp32 = torch.ops.rwkv7_wind_fp32_hs32
+        torch.ops.rwkv7_wind_fp32.backward(w,r,k,v,z,b, dy,s,sa, dw,dr,dk,dv,dz,db)
+        return dw,dr,dk,dv,dz,db
+def RUN_RWKV7_FP32(r,w,k,v,a,b):
+    B,T,H,C = r.shape
+    r,w,k,v,a,b = [i.view(B,T,H,C) for i in [r,w,k,v,a,b]]
+    return rwkv7_wind_fp32.apply(w,r,k,v,a,b).view(B,T,H,C)
 
 class DeltaNet(nn.Module):
     r"""
@@ -126,7 +163,7 @@ class DeltaNet(nn.Module):
 
         self.use_beta = use_beta
         if self.use_beta:
-            self.b_proj = nn.Linear(hidden_size, self.num_heads, bias=False)
+            self.b_proj = nn.Linear(hidden_size, hidden_size, bias=False) # use vector b (instead of scalar b) for each head
         if use_short_conv:
             self.conv_size = conv_size
             self.q_conv1d = ShortConvolution(
@@ -227,7 +264,7 @@ class DeltaNet(nn.Module):
         if self.use_beta:
             beta = self.b_proj(hidden_states).sigmoid()
         else:
-            beta = q.new_ones(q.shape[0], q.shape[1], q.shape[2])
+            beta = q.new_ones(q.shape[0], q.shape[1], q.shape[2]*q.shape[3]) # use vector b (instead of scalar b) for each head
 
         if self.allow_neg_eigval:
             beta = beta * 2.
@@ -236,42 +273,48 @@ class DeltaNet(nn.Module):
         if attention_mask is not None:
             beta = beta.mul(attention_mask[:, -beta.shape[-2]:, None])
 
-        recurrent_state = last_state['recurrent_state'] if last_state is not None else None
-        cu_seqlens = kwargs.get('cu_seqlens', None)
-        if mode == 'fused_recurrent':
-            o, recurrent_state = fused_recurrent_delta_rule(
-                q=q.to(torch.bfloat16),
-                k=k.to(torch.bfloat16),
-                v=v.to(torch.bfloat16),
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True if self.qk_norm == 'l2' else False
-            )
-        elif mode == 'chunk':
-            o, recurrent_state = chunk_delta_rule(
-                q=q.to(torch.bfloat16),
-                k=k.to(torch.bfloat16),
-                v=v.to(torch.bfloat16),
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True if self.qk_norm == 'l2' else False
-            )
-        else:
-            raise NotImplementedError(f"Not supported mode `{mode}`.")
+        # recurrent_state = last_state['recurrent_state'] if last_state is not None else None
+        # cu_seqlens = kwargs.get('cu_seqlens', None)
+        # if mode == 'fused_recurrent':
+        #     o, recurrent_state = fused_recurrent_delta_rule(
+        #         q=q.to(torch.bfloat16),
+        #         k=k.to(torch.bfloat16),
+        #         v=v.to(torch.bfloat16),
+        #         beta=beta,
+        #         initial_state=recurrent_state,
+        #         output_final_state=use_cache,
+        #         cu_seqlens=cu_seqlens,
+        #         head_first=False,
+        #         use_qk_l2norm_in_kernel=True if self.qk_norm == 'l2' else False
+        #     )
+        # elif mode == 'chunk':
+        #     o, recurrent_state = chunk_delta_rule(
+        #         q=q.to(torch.bfloat16),
+        #         k=k.to(torch.bfloat16),
+        #         v=v.to(torch.bfloat16),
+        #         beta=beta,
+        #         initial_state=recurrent_state,
+        #         output_final_state=use_cache,
+        #         cu_seqlens=cu_seqlens,
+        #         head_first=False,
+        #         use_qk_l2norm_in_kernel=True if self.qk_norm == 'l2' else False
+        #     )
+        # else:
+        #     raise NotImplementedError(f"Not supported mode `{mode}`.")
 
-        if past_key_values is not None:
-            past_key_values.update(
-                recurrent_state=recurrent_state,
-                conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
-                layer_idx=self.layer_idx,
-                offset=q.shape[1]
-            )
+        # if past_key_values is not None:
+        #     past_key_values.update(
+        #         recurrent_state=recurrent_state,
+        #         conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
+        #         layer_idx=self.layer_idx,
+        #         offset=q.shape[1]
+        #     )
+
+        B,T,H,D = q.shape
+        beta = beta.view(B,T,H,D)
+        q = F.normalize(q.view(B,T,H,D), dim=-1, p=2.0) # align with delta_rule kernel
+        k = F.normalize(k.view(B,T,H,D), dim=-1, p=2.0) # align with delta_rule kernel
+        o = RUN_RWKV7_FP32(r=q*(D**(-0.5)), w=q*0-999, k=k, v=beta*v, a=-beta*k, b=k) # align with delta_rule kernel (set w to a very negative number to disable it)
 
         o = o.float()
 

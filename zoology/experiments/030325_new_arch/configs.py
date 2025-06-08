@@ -59,14 +59,14 @@ conv_mixer = dict(
 from zoology.experiments.models_repo import add_attention, add_based, add_mamba2, add_rwkv7, add_delta_net, add_gla, add_gated_delta_net, add_deepseek_nsa
 
 models = add_delta_net(models, conv_mixer, input_seq_len, model_factory_kwargs)
-models = add_rwkv7(models, conv_mixer, input_seq_len, model_factory_kwargs)
-models = add_gla(models, conv_mixer, input_seq_len, model_factory_kwargs)
-models = add_gated_delta_net(models, conv_mixer, input_seq_len, model_factory_kwargs)
-models = add_deepseek_nsa(models, conv_mixer, input_seq_len, model_factory_kwargs)
+# models = add_rwkv7(models, conv_mixer, input_seq_len, model_factory_kwargs)
+# models = add_gla(models, conv_mixer, input_seq_len, model_factory_kwargs)
+# models = add_gated_delta_net(models, conv_mixer, input_seq_len, model_factory_kwargs)
+# models = add_deepseek_nsa(models, conv_mixer, input_seq_len, model_factory_kwargs)
 
 # convenience for filtering out 
-included = ["deepseek_nsa"]
-models = [m for m in models if any([i in m.name for i in included])]
+# included = ["deepseek_nsa"]
+# models = [m for m in models if any([i in m.name for i in included])]
 
 
 # 3. Finally we'll create a train config for each
@@ -80,8 +80,8 @@ for model in models:
             learning_rate=lr,
             max_epochs=32,
             logger=LoggerConfig(
-                project_name="0325_zoology",
-                entity="hazy-research"
+                project_name="zoology",
+                entity="blinkdl"
             ),
             slice_keys=["num_kv_pairs"],
             sweep_id=sweep_name,

@@ -28,7 +28,7 @@ For example, this is from the recent ATLAS (2505.23735) paper, and the green RWK
 
 ![image](https://github.com/user-attachments/assets/ceb62cc6-53eb-4d30-9542-ec68b111c515)
 
-The second major issue is, a short-conv of length 4 is highly beneficial for grokking this toy MQAR task (but NOT for real language modeling), and it's given to all other arch, except RWKV-7, which is using its default token-shift (similar to a short-conv of length 2), putting it at an unfair disadvantage.
+The second major issue is, a short-conv of length 4 is highly beneficial for grokking this toy MQAR task (but NOT for real language modeling), and it's given to all other arch, except RWKV-7, which is using its default token-shift (similar to a short-conv of length 2), **putting it at an unfair disadvantage**.
 
 From zoology readme:
 
@@ -69,6 +69,19 @@ Let's compare [BetterDeltaNet using RWKV-7 kernel (black)] vs [DeltaNet (color)]
 14.31 ± 0.07% vs 13.09 ± 0.67%. BetterDeltaNet with RWKV-7 kernel wins.
 
 There are plenty of further improvements in RWKV-7, and here I show a simple replacement of DeltaNet by RWKV-7 kernel (without adding further improvements from RWKV-7) is enough to boost performance, as it should be, because as I said, the RWKV-7 kernel is **strictly more expressive**.
+
+How to run it (requires 1 GPU with 16G VRAM):
+
+```bash
+git clone https://github.com/BlinkDL/zoology
+cd zoology
+pip install --no-use-pep517 flash-linear-attention
+pip install -e .[extra,analysis]
+
+# change logger entity in zoology/experiments/030325_new_arch/configs.py to your wandb acc first
+
+python -m zoology.launch zoology/experiments/030325_new_arch/configs.py
+```
 
 ### Conclusion:
 
